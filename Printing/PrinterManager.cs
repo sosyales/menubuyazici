@@ -101,168 +101,166 @@ internal sealed class PrinterManager : IDisposable
         if (!string.IsNullOrWhiteSpace(content.Html))
         {
             _htmlPrinter.SelectedPrinter = SelectedPrinter;
-            _htmlPrinter.PrinterWidth = content.PrinterWidth;
+            _htmlPrinter.PrinterWidth = NormalizePrinterWidth(content.PrinterWidth);
             return _htmlPrinter.PrintHtmlAsync(content.Html!, cancellationToken);
         }
 
         var tcs = new TaskCompletionSource<bool>();
-        
+
         var thread = new Thread(() =>
         {
             try
             {
                 lock (_printLock)
                 {
-                var lineEnumerator = content.Lines.GetEnumerator();
-                var qrImage = content.QrImage;
-                
-                using var printDocument = new PrintDocument();
-                
-                try
-                {
-                    if (!string.IsNullOrWhiteSpace(SelectedPrinter))
+                    var lineEnumerator = content.Lines.GetEnumerator();
+                    var qrImage = content.QrImage;
+
+                    using var printDocument = new PrintDocument();
+
+                    try
                     {
-                        printDocument.PrinterSettings.PrinterName = SelectedPrinter;
-                        
-                        if (!printDocument.PrinterSettings.IsValid)
+                        if (!string.IsNullOrWhiteSpace(SelectedPrinter))
                         {
-                            // Seçili yazıcı geçersiz, varsayılanı kullan
-                            printDocument.PrinterSettings.PrinterName = null;
+                            printDocument.PrinterSettings.PrinterName = SelectedPrinter;
+
+                            if (!printDocument.PrinterSettings.IsValid)
+                            {
+                                printDocument.PrinterSettings.PrinterName = null;
+                            }
                         }
                     }
-                }
-                catch
-                {
-                    // Yazıcı ayarı başarısız, varsayılanı kullan
-                }
-                
-                printDocument.OriginAtMargins = false;
-                printDocument.DefaultPageSettings.Margins = new Margins(0, 0, 0, 0);
-                
-                try
-                {
-                    ApplyPaperSize(printDocument);
-                }
-                catch
-                {
-                    // Ignore paper size errors
-                }
-
-                printDocument.PrintPage += (sender, e) =>
-                {
-                    if (e.Graphics == null)
+                    catch
                     {
-                        e.HasMorePages = false;
-                        return;
+                        // ignore printer selection errors
                     }
 
-                    var graphics = e.Graphics;
-                    var marginBounds = e.MarginBounds;
-                    if (marginBounds.Width <= 0 || marginBounds.Height <= 0)
+                    printDocument.OriginAtMargins = false;
+                    printDocument.DefaultPageSettings.Margins = new Margins(0, 0, 0, 0);
+
+                    try
                     {
-                        var clip = graphics.VisibleClipBounds;
-                        marginBounds = new Rectangle((int)clip.Left, (int)clip.Top, (int)clip.Width, (int)clip.Height);
+                        ApplyPaperSize(printDocument);
+                    }
+                    catch
+                    {
+                        // ignore paper size errors
                     }
 
-                    var horizontalPadding = GetHorizontalPadding();
-                    var verticalPadding = GetVerticalPadding();
-                    var contentWidth = Math.Max(20f, marginBounds.Width - (horizontalPadding * 2));
-                    var left = marginBounds.Left + horizontalPadding;
-                    var top = marginBounds.Top + verticalPadding;
-                    var bottomLimit = marginBounds.Bottom - verticalPadding;
-                    var layoutBounds = new RectangleF(left, top, contentWidth, bottomLimit - top);
-
-                    float y = layoutBounds.Top;
-                    var defaultLineHeight = ResolveFont(PrintLineStyle.Normal).GetHeight(graphics) + 2;
-
-                    while (lineEnumerator.MoveNext())
+                    printDocument.PrintPage += (sender, e) =>
                     {
-                        var line = lineEnumerator.Current;
-                        switch (line.Kind)
+                        if (e.Graphics == null)
                         {
-                            case PrintLineKind.Spacer:
+                            e.HasMorePages = false;
+                            return;
+                        }
+
+                        var graphics = e.Graphics;
+                        var marginBounds = e.MarginBounds;
+                        if (marginBounds.Width <= 0 || marginBounds.Height <= 0)
+                        {
+                            var clip = graphics.VisibleClipBounds;
+                            marginBounds = new Rectangle((int)clip.Left, (int)clip.Top, (int)clip.Width, (int)clip.Height);
+                        }
+
+                        var horizontalPadding = GetHorizontalPadding();
+                        var verticalPadding = GetVerticalPadding();
+                        var contentWidth = Math.Max(20f, marginBounds.Width - (horizontalPadding * 2));
+                        var left = marginBounds.Left + horizontalPadding;
+                        var top = marginBounds.Top + verticalPadding;
+                        var bottomLimit = marginBounds.Bottom - verticalPadding;
+                        var layoutBounds = new RectangleF(left, top, contentWidth, bottomLimit - top);
+
+                        float y = layoutBounds.Top;
+                        var defaultLineHeight = ResolveFont(PrintLineStyle.Normal).GetHeight(graphics) + 2;
+
+                        while (lineEnumerator.MoveNext())
+                        {
+                            var line = lineEnumerator.Current;
+                            switch (line.Kind)
+                            {
+                                case PrintLineKind.Spacer:
+                                    {
+                                        var spacing = line.CustomSpacing ?? (defaultLineHeight / 2f);
+                                        if (y + spacing > layoutBounds.Bottom)
+                                        {
+                                            e.HasMorePages = true;
+                                            return;
+                                        }
+                                        y += spacing;
+                                        continue;
+                                    }
+                                case PrintLineKind.Separator:
+                                    {
+                                        var thickness = line.CustomSpacing ?? 6f;
+                                        if (!DrawSeparator(graphics, layoutBounds, ref y, thickness))
+                                        {
+                                            e.HasMorePages = true;
+                                            return;
+                                        }
+                                        continue;
+                                    }
+                                case PrintLineKind.Columns:
+                                    {
+                                        if (!DrawColumns(graphics, line, layoutBounds, ref y))
+                                        {
+                                            e.HasMorePages = true;
+                                            return;
+                                        }
+                                        continue;
+                                    }
+                            }
+
+                            var font = ResolveFont(line.Style);
+                            var lineHeight = font.GetHeight(graphics) + 2;
+
+                            if (!DrawWrappedText(graphics, line, font, layoutBounds, ref y, lineHeight))
+                            {
+                                e.HasMorePages = true;
+                                return;
+                            }
+
+                            if (line.CustomSpacing.HasValue)
+                            {
+                                var spacing = line.CustomSpacing.Value;
+                                if (spacing > 0)
                                 {
-                                    var spacing = line.CustomSpacing ?? (defaultLineHeight / 2f);
                                     if (y + spacing > layoutBounds.Bottom)
                                     {
                                         e.HasMorePages = true;
                                         return;
                                     }
                                     y += spacing;
-                                    continue;
                                 }
-                            case PrintLineKind.Separator:
-                                {
-                                    var thickness = line.CustomSpacing ?? 6f;
-                                    if (!DrawSeparator(graphics, layoutBounds, ref y, thickness))
-                                    {
-                                        e.HasMorePages = true;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                            case PrintLineKind.Columns:
-                                {
-                                    if (!DrawColumns(graphics, line, layoutBounds, ref y))
-                                    {
-                                        e.HasMorePages = true;
-                                        return;
-                                    }
-                                    continue;
-                                }
-                        }
-
-                        var font = ResolveFont(line.Style);
-                        var lineHeight = font.GetHeight(graphics) + 2;
-
-                        if (!DrawWrappedText(graphics, line, font, layoutBounds, ref y, lineHeight))
-                        {
-                            e.HasMorePages = true;
-                            return;
-                        }
-
-                        if (line.CustomSpacing.HasValue)
-                        {
-                            var spacing = line.CustomSpacing.Value;
-                            if (spacing > 0)
-                            {
-                                if (y + spacing > layoutBounds.Bottom)
-                                {
-                                    e.HasMorePages = true;
-                                    return;
-                                }
-                                y += spacing;
                             }
                         }
-                    }
 
-                    if (qrImage != null)
-                    {
-                        var qrSize = Math.Min((int)(contentWidth * 0.75f), 220);
-                        if (y + qrSize > layoutBounds.Bottom)
+                        if (qrImage != null)
                         {
-                            e.HasMorePages = true;
-                            return;
+                            var qrSize = Math.Min((int)(contentWidth * 0.75f), 220);
+                            if (y + qrSize > layoutBounds.Bottom)
+                            {
+                                e.HasMorePages = true;
+                                return;
+                            }
+
+                            var qrLeft = left + (contentWidth - qrSize) / 2f;
+                            var destRect = new Rectangle((int)qrLeft, (int)y + 10, qrSize, qrSize);
+                            graphics.DrawImage(qrImage, destRect);
+                            y += qrSize + 20;
                         }
 
-                        var qrLeft = left + (contentWidth - qrSize) / 2f;
-                        var destRect = new Rectangle((int)qrLeft, (int)y + 10, qrSize, qrSize);
-                        graphics.DrawImage(qrImage, destRect);
-                        y += qrSize + 20;
-                    }
+                        e.HasMorePages = false;
+                    };
 
-                    e.HasMorePages = false;
-                };
-                
                     try
                     {
-                        // Ensure printer is ready
-                        if (printDocument.PrinterSettings == null || string.IsNullOrEmpty(printDocument.PrinterSettings.PrinterName))
+                        if (printDocument.PrinterSettings == null ||
+                            string.IsNullOrEmpty(printDocument.PrinterSettings.PrinterName))
                         {
                             throw new InvalidOperationException("Yazıcı ayarları geçersiz");
                         }
-                        
-                        // Force synchronous printing
+
                         printDocument.PrintController = new StandardPrintController();
                         printDocument.Print();
                     }
@@ -271,20 +269,20 @@ internal sealed class PrinterManager : IDisposable
                         lineEnumerator.Dispose();
                         qrImage?.Dispose();
                     }
-                    
+
                     tcs.SetResult(true);
                 }
-                catch (Exception ex)
-                {
-                    tcs.SetException(ex);
-                }
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
             }
         });
-        
+
         thread.SetApartmentState(ApartmentState.STA);
         thread.IsBackground = true;
         thread.Start();
-        
+
         return tcs.Task;
     }
 
@@ -593,6 +591,7 @@ internal sealed class PrinterManager : IDisposable
 
         if (TryBuildStructuredReceipt(payloadDoc, out var structuredContent) && structuredContent.Lines.Count > 0)
         {
+            structuredContent.PrinterWidth = PrinterWidth;
             return structuredContent;
         }
 
@@ -683,14 +682,16 @@ internal sealed class PrinterManager : IDisposable
             return false;
         }
 
-        content = new PrintContent();
+        content = new PrintContent
+        {
+            PrinterWidth = PrinterWidth
+        };
 
         if (orderElement.TryGetProperty("printer_width", out var widthElement) && widthElement.ValueKind == JsonValueKind.String)
         {
             PrinterWidth = widthElement.GetString() ?? PrinterWidth;
+            content.PrinterWidth = PrinterWidth;
         }
-
-        content.PrinterWidth = PrinterWidth;
 
         TryLoadQrImage(content, orderElement);
 
@@ -1455,36 +1456,9 @@ internal sealed class PrinterManager : IDisposable
                 if (!string.IsNullOrWhiteSpace(value))
                 {
                     url = value;
-        return true;
-    }
-
-    private string NormalizePrinterWidth(string? requested)
-    {
-        if (string.IsNullOrWhiteSpace(requested))
-        {
-            return PrinterWidth;
-        }
-
-        var normalized = requested.Trim().ToLowerInvariant();
-        if (normalized.Contains("80") || normalized.Contains("72") || normalized.Contains("3"))
-        {
-            return "80mm";
-        }
-
-        return "58mm";
-    }
-
-    public void Dispose()
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        _disposed = true;
-        _htmlPrinter.Dispose();
-    }
-}
+                    return true;
+                }
+            }
         }
 
         url = string.Empty;
@@ -1524,6 +1498,33 @@ internal sealed class PrinterManager : IDisposable
                 System.Threading.Thread.Sleep(500);
             }
         }
+    }
+
+    private string NormalizePrinterWidth(string? requested)
+    {
+        if (string.IsNullOrWhiteSpace(requested))
+        {
+            return PrinterWidth;
+        }
+
+        var normalized = requested.Trim().ToLowerInvariant();
+        if (normalized.Contains("80") || normalized.Contains("72") || normalized.Contains("3"))
+        {
+            return "80mm";
+        }
+
+        return "58mm";
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _htmlPrinter.Dispose();
     }
 
     private readonly struct ReceiptTotal
