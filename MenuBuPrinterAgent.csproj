@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="icon.png" Link="Resources\icon.png" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="icon.ico" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2739.15" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <Target Name="CopyWebView2Runtime" AfterTargets="Build">
+    <ItemGroup>
+      <WebView2Files Include="$(NuGetPackageRoot)microsoft.web.webview2\**\runtimes\**\*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(WebView2Files)" DestinationFolder="$(OutDir)%(RecursiveDir)" />
+  </Target>
+
+</Project>

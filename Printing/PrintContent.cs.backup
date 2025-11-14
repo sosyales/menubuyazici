@@ -1,0 +1,13 @@
+namespace MenuBuPrinterAgent.Printing;
+
+internal sealed class PrintContent
+{
+    public PrintContent(string html, string printerWidth)
+    {
+        Html = html;
+        PrinterWidth = printerWidth;
+    }
+
+    public string Html { get; }
+    public string PrinterWidth { get; }
+}

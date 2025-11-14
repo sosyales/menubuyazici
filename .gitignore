@@ -1,0 +1,18 @@
+# Logs
+logs/*.log
+storage/sessions/*
+storage/cache/*
+
+# Sensitive files
+config.local.php
+*.asc
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

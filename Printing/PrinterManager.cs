@@ -1,0 +1,1542 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Printing;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace MenuBuPrinterAgent.Printing;
+
+internal sealed class PrinterManager : IDisposable
+{
+    private readonly HttpClient _httpClient;
+    private readonly object _printLock = new();
+    private readonly HtmlPrinter _htmlPrinter = new();
+    private Font _normalFont58 = null!;
+    private Font _boldFont58 = null!;
+    private Font _smallFont58 = null!;
+    private Font _normalFont80 = null!;
+    private Font _boldFont80 = null!;
+    private Font _smallFont80 = null!;
+    private static readonly CultureInfo TrCulture = new("tr-TR");
+    private string _printerWidth = "58mm";
+    private int _fontSizeAdjustment = 0;
+    private bool _disposed;
+
+    public PrinterManager(HttpClient httpClient)
+    {
+        _httpClient = httpClient;
+        _httpClient.Timeout = TimeSpan.FromSeconds(20);
+        UpdateFonts();
+    }
+
+    private void UpdateFonts()
+    {
+        _normalFont58?.Dispose();
+        _boldFont58?.Dispose();
+        _smallFont58?.Dispose();
+        _normalFont80?.Dispose();
+        _boldFont80?.Dispose();
+        _smallFont80?.Dispose();
+
+        var base58 = Math.Max(6, 8 + _fontSizeAdjustment);
+        var base80 = Math.Max(7, 10 + _fontSizeAdjustment);
+
+        _normalFont58 = new Font("Arial", base58, FontStyle.Regular);
+        _boldFont58 = new Font("Arial", base58, FontStyle.Bold);
+        _smallFont58 = new Font("Arial", Math.Max(5, base58 - 1), FontStyle.Regular);
+        _normalFont80 = new Font("Arial", base80, FontStyle.Regular);
+        _boldFont80 = new Font("Arial", base80, FontStyle.Bold);
+        _smallFont80 = new Font("Arial", Math.Max(6, base80 - 1), FontStyle.Regular);
+    }
+
+    public string? SelectedPrinter { get; set; }
+    public string PrinterWidth
+    {
+        get => _printerWidth;
+        set => _printerWidth = string.IsNullOrWhiteSpace(value) ? "58mm" : value;
+    }
+    public int FontSizeAdjustment
+    {
+        get => _fontSizeAdjustment;
+        set
+        {
+            if (_fontSizeAdjustment != value)
+            {
+                _fontSizeAdjustment = Math.Max(-3, Math.Min(3, value));
+                UpdateFonts();
+            }
+        }
+    }
+
+    public Task PrintAsync(JsonDocument payloadDoc, CancellationToken cancellationToken)
+    {
+        var content = BuildContent(payloadDoc);
+        return PrintAsync(content, cancellationToken);
+    }
+
+    public Task PrintHtmlAsync(string html, string? printerWidth, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            throw new InvalidOperationException("Yazdırılacak HTML içeriği bulunamadı.");
+        }
+
+        var content = new PrintContent
+        {
+            Html = html,
+            PrinterWidth = NormalizePrinterWidth(printerWidth)
+        };
+        return PrintAsync(content, cancellationToken);
+    }
+
+    private Task PrintAsync(PrintContent content, CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(content.Html))
+        {
+            _htmlPrinter.SelectedPrinter = SelectedPrinter;
+            _htmlPrinter.PrinterWidth = content.PrinterWidth;
+            return _htmlPrinter.PrintHtmlAsync(content.Html!, cancellationToken);
+        }
+
+        var tcs = new TaskCompletionSource<bool>();
+        
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                lock (_printLock)
+                {
+                var lineEnumerator = content.Lines.GetEnumerator();
+                var qrImage = content.QrImage;
+                
+                using var printDocument = new PrintDocument();
+                
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(SelectedPrinter))
+                    {
+                        printDocument.PrinterSettings.PrinterName = SelectedPrinter;
+                        
+                        if (!printDocument.PrinterSettings.IsValid)
+                        {
+                            // Seçili yazıcı geçersiz, varsayılanı kullan
+                            printDocument.PrinterSettings.PrinterName = null;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Yazıcı ayarı başarısız, varsayılanı kullan
+                }
+                
+                printDocument.OriginAtMargins = false;
+                printDocument.DefaultPageSettings.Margins = new Margins(0, 0, 0, 0);
+                
+                try
+                {
+                    ApplyPaperSize(printDocument);
+                }
+                catch
+                {
+                    // Ignore paper size errors
+                }
+
+                printDocument.PrintPage += (sender, e) =>
+                {
+                    if (e.Graphics == null)
+                    {
+                        e.HasMorePages = false;
+                        return;
+                    }
+
+                    var graphics = e.Graphics;
+                    var marginBounds = e.MarginBounds;
+                    if (marginBounds.Width <= 0 || marginBounds.Height <= 0)
+                    {
+                        var clip = graphics.VisibleClipBounds;
+                        marginBounds = new Rectangle((int)clip.Left, (int)clip.Top, (int)clip.Width, (int)clip.Height);
+                    }
+
+                    var horizontalPadding = GetHorizontalPadding();
+                    var verticalPadding = GetVerticalPadding();
+                    var contentWidth = Math.Max(20f, marginBounds.Width - (horizontalPadding * 2));
+                    var left = marginBounds.Left + horizontalPadding;
+                    var top = marginBounds.Top + verticalPadding;
+                    var bottomLimit = marginBounds.Bottom - verticalPadding;
+                    var layoutBounds = new RectangleF(left, top, contentWidth, bottomLimit - top);
+
+                    float y = layoutBounds.Top;
+                    var defaultLineHeight = ResolveFont(PrintLineStyle.Normal).GetHeight(graphics) + 2;
+
+                    while (lineEnumerator.MoveNext())
+                    {
+                        var line = lineEnumerator.Current;
+                        switch (line.Kind)
+                        {
+                            case PrintLineKind.Spacer:
+                                {
+                                    var spacing = line.CustomSpacing ?? (defaultLineHeight / 2f);
+                                    if (y + spacing > layoutBounds.Bottom)
+                                    {
+                                        e.HasMorePages = true;
+                                        return;
+                                    }
+                                    y += spacing;
+                                    continue;
+                                }
+                            case PrintLineKind.Separator:
+                                {
+                                    var thickness = line.CustomSpacing ?? 6f;
+                                    if (!DrawSeparator(graphics, layoutBounds, ref y, thickness))
+                                    {
+                                        e.HasMorePages = true;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                            case PrintLineKind.Columns:
+                                {
+                                    if (!DrawColumns(graphics, line, layoutBounds, ref y))
+                                    {
+                                        e.HasMorePages = true;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                        }
+
+                        var font = ResolveFont(line.Style);
+                        var lineHeight = font.GetHeight(graphics) + 2;
+
+                        if (!DrawWrappedText(graphics, line, font, layoutBounds, ref y, lineHeight))
+                        {
+                            e.HasMorePages = true;
+                            return;
+                        }
+
+                        if (line.CustomSpacing.HasValue)
+                        {
+                            var spacing = line.CustomSpacing.Value;
+                            if (spacing > 0)
+                            {
+                                if (y + spacing > layoutBounds.Bottom)
+                                {
+                                    e.HasMorePages = true;
+                                    return;
+                                }
+                                y += spacing;
+                            }
+                        }
+                    }
+
+                    if (qrImage != null)
+                    {
+                        var qrSize = Math.Min((int)(contentWidth * 0.75f), 220);
+                        if (y + qrSize > layoutBounds.Bottom)
+                        {
+                            e.HasMorePages = true;
+                            return;
+                        }
+
+                        var qrLeft = left + (contentWidth - qrSize) / 2f;
+                        var destRect = new Rectangle((int)qrLeft, (int)y + 10, qrSize, qrSize);
+                        graphics.DrawImage(qrImage, destRect);
+                        y += qrSize + 20;
+                    }
+
+                    e.HasMorePages = false;
+                };
+                
+                    try
+                    {
+                        // Ensure printer is ready
+                        if (printDocument.PrinterSettings == null || string.IsNullOrEmpty(printDocument.PrinterSettings.PrinterName))
+                        {
+                            throw new InvalidOperationException("Yazıcı ayarları geçersiz");
+                        }
+                        
+                        // Force synchronous printing
+                        printDocument.PrintController = new StandardPrintController();
+                        printDocument.Print();
+                    }
+                    finally
+                    {
+                        lineEnumerator.Dispose();
+                        qrImage?.Dispose();
+                    }
+                    
+                    tcs.SetResult(true);
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetException(ex);
+                }
+            }
+        });
+        
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.IsBackground = true;
+        thread.Start();
+        
+        return tcs.Task;
+    }
+
+
+    private bool DrawWrappedText(Graphics g, PrintLine line, Font font, RectangleF bounds, ref float y, float lineHeight)
+    {
+        if (string.IsNullOrWhiteSpace(line.Text))
+        {
+            y += lineHeight;
+            return true;
+        }
+
+        using var format = CreateFormat(line.Alignment);
+        var segments = WrapText(g, line.Text, font, bounds.Width, format);
+        if (segments.Count == 0)
+        {
+            segments.Add(string.Empty);
+        }
+
+        foreach (var segment in segments)
+        {
+            if (y + lineHeight > bounds.Bottom)
+            {
+                return false;
+            }
+
+            if (!string.IsNullOrEmpty(segment))
+            {
+                g.DrawString(segment, font, Brushes.Black,
+                    new RectangleF(bounds.Left, y, bounds.Width, lineHeight), format);
+            }
+            y += lineHeight;
+        }
+
+        return true;
+    }
+
+    private Font ResolveFont(PrintLineStyle style)
+    {
+        var useWideLayout = _printerWidth.StartsWith("80", StringComparison.OrdinalIgnoreCase);
+        return style switch
+        {
+            PrintLineStyle.Bold => useWideLayout ? _boldFont80 : _boldFont58,
+            PrintLineStyle.Small => useWideLayout ? _smallFont80 : _smallFont58,
+            _ => useWideLayout ? _normalFont80 : _normalFont58
+        };
+    }
+
+    private float GetHorizontalPadding() =>
+        _printerWidth.StartsWith("80", StringComparison.OrdinalIgnoreCase) ? 10f : 6f;
+
+    private float GetVerticalPadding() =>
+        _printerWidth.StartsWith("80", StringComparison.OrdinalIgnoreCase) ? 6f : 4f;
+
+    private static StringFormat CreateFormat(PrintLineAlignment alignment)
+    {
+        var format = new StringFormat(StringFormatFlags.MeasureTrailingSpaces)
+        {
+            LineAlignment = StringAlignment.Near,
+            Trimming = StringTrimming.None
+        };
+        format.FormatFlags |= StringFormatFlags.NoClip;
+        format.Alignment = alignment switch
+        {
+            PrintLineAlignment.Center => StringAlignment.Center,
+            PrintLineAlignment.Right => StringAlignment.Far,
+            _ => StringAlignment.Near
+        };
+        return format;
+    }
+
+    private static List<string> WrapText(Graphics g, string text, Font font, float maxWidth, StringFormat format)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrEmpty(text))
+        {
+            return result;
+        }
+
+        foreach (var raw in text.Replace("\r", string.Empty).Split('\n'))
+        {
+            var line = raw.TrimEnd();
+            if (line.Length == 0)
+            {
+                result.Add(string.Empty);
+                continue;
+            }
+
+            var words = line.Split(' ');
+            var currentLine = string.Empty;
+            foreach (var word in words)
+            {
+                if (string.IsNullOrEmpty(word))
+                {
+                    continue;
+                }
+
+                var candidate = string.IsNullOrEmpty(currentLine) ? word : $"{currentLine} {word}";
+                var size = g.MeasureString(candidate, font, int.MaxValue, format);
+                if (size.Width > maxWidth + 0.1f)
+                {
+                    if (string.IsNullOrEmpty(currentLine))
+                    {
+                        foreach (var chunk in SplitLongWord(g, word, font, maxWidth, format))
+                        {
+                            if (!string.IsNullOrEmpty(chunk))
+                            {
+                                result.Add(chunk);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        result.Add(currentLine);
+                        currentLine = word;
+                    }
+                }
+                else
+                {
+                    currentLine = candidate;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(currentLine))
+            {
+                result.Add(currentLine);
+            }
+        }
+
+        return result;
+    }
+
+    private static IEnumerable<string> SplitLongWord(Graphics g, string word, Font font, float maxWidth, StringFormat format)
+    {
+        var chunks = new List<string>();
+        if (string.IsNullOrEmpty(word))
+        {
+            return chunks;
+        }
+
+        var current = string.Empty;
+        foreach (var ch in word)
+        {
+            var candidate = current + ch;
+            var size = g.MeasureString(candidate, font, int.MaxValue, format);
+            if (size.Width > maxWidth + 0.1f && current.Length > 0)
+            {
+                chunks.Add(current);
+                current = ch.ToString();
+            }
+            else
+            {
+                current = candidate;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(current))
+        {
+            chunks.Add(current);
+        }
+
+        return chunks;
+    }
+
+    private bool DrawSeparator(Graphics g, RectangleF bounds, ref float y, float thickness)
+    {
+        var height = Math.Max(4f, thickness);
+        if (y + height > bounds.Bottom)
+        {
+            return false;
+        }
+
+        var penWidth = Math.Max(1f, Math.Min(4f, thickness / 3f));
+        using var pen = new Pen(Color.Black, penWidth);
+        var midY = y + (height / 2f);
+        g.DrawLine(pen, bounds.Left, midY, bounds.Right, midY);
+        y += height;
+        return true;
+    }
+
+    private bool DrawColumns(Graphics g, PrintLine line, RectangleF bounds, ref float y)
+    {
+        if (line.Columns is not { Count: > 0 })
+        {
+            return true;
+        }
+
+        var columns = line.Columns;
+        var totalWidth = bounds.Width;
+
+        var widths = CalculateColumnWidths(columns, totalWidth);
+        var fonts = columns.Select(c => ResolveFont(c.Style)).ToArray();
+        var formats = columns.Select(c => CreateFormat(c.Alignment)).ToArray();
+        var wrappedTexts = new List<List<string>>(columns.Count);
+        float baseLineHeight = 0;
+
+        for (var i = 0; i < columns.Count; i++)
+        {
+            var font = fonts[i];
+            baseLineHeight = Math.Max(baseLineHeight, font.GetHeight(g) + 2);
+            var textLines = WrapText(g, columns[i].Text ?? string.Empty, font, widths[i], formats[i]);
+            if (textLines.Count == 0)
+            {
+                textLines.Add(string.Empty);
+            }
+            wrappedTexts.Add(textLines);
+        }
+
+        var maxLineCount = wrappedTexts.Max(l => l.Count);
+        for (var lineIndex = 0; lineIndex < maxLineCount; lineIndex++)
+        {
+            if (y + baseLineHeight > bounds.Bottom)
+            {
+                DisposeFormats(formats);
+                return false;
+            }
+
+            var x = bounds.Left;
+            for (var colIndex = 0; colIndex < columns.Count; colIndex++)
+            {
+                var text = lineIndex < wrappedTexts[colIndex].Count ? wrappedTexts[colIndex][lineIndex] : string.Empty;
+                if (!string.IsNullOrEmpty(text))
+                {
+                    g.DrawString(text, fonts[colIndex], Brushes.Black,
+                        new RectangleF(x, y, widths[colIndex], baseLineHeight), formats[colIndex]);
+                }
+                x += widths[colIndex];
+            }
+
+            y += baseLineHeight;
+        }
+
+        DisposeFormats(formats);
+
+        if (line.CustomSpacing.HasValue && line.CustomSpacing.Value > 0)
+        {
+            var extra = line.CustomSpacing.Value;
+            if (y + extra > bounds.Bottom)
+            {
+                return false;
+            }
+            y += extra;
+        }
+
+        return true;
+    }
+
+    private static float[] CalculateColumnWidths(IReadOnlyList<PrintColumn> columns, float totalWidth)
+    {
+        var widths = new float[columns.Count];
+        float assigned = 0;
+        var flexibleCount = 0;
+
+        for (var i = 0; i < columns.Count; i++)
+        {
+            var column = columns[i];
+            if (column.WidthFraction.HasValue)
+            {
+                var clamped = Math.Max(0f, Math.Min(1f, column.WidthFraction.Value));
+                widths[i] = totalWidth * clamped;
+                assigned += widths[i];
+            }
+            else
+            {
+                flexibleCount++;
+            }
+        }
+
+        var remaining = Math.Max(0f, totalWidth - assigned);
+        var flexibleWidth = flexibleCount > 0 ? remaining / flexibleCount : 0f;
+        for (var i = 0; i < columns.Count; i++)
+        {
+            if (!columns[i].WidthFraction.HasValue)
+            {
+                widths[i] = flexibleWidth;
+            }
+        }
+
+        // Adjust rounding errors
+        var sum = widths.Sum();
+        var diff = totalWidth - sum;
+        if (Math.Abs(diff) > 0.1f)
+        {
+            widths[^1] += diff;
+        }
+
+        return widths;
+    }
+
+    private static void DisposeFormats(StringFormat[] formats)
+    {
+        foreach (var format in formats)
+        {
+            format.Dispose();
+        }
+    }
+
+    private PrintContent BuildContent(JsonDocument payloadDoc)
+    {
+        var root = payloadDoc.RootElement;
+
+        if (root.TryGetProperty("printer_width", out var widthElement) && widthElement.ValueKind == JsonValueKind.String)
+        {
+            PrinterWidth = widthElement.GetString() ?? PrinterWidth;
+        }
+
+        if (TryBuildStructuredReceipt(payloadDoc, out var structuredContent) && structuredContent.Lines.Count > 0)
+        {
+            return structuredContent;
+        }
+
+        var content = new PrintContent
+        {
+            PrinterWidth = PrinterWidth
+        };
+        if (root.TryGetProperty("lines", out var linesElement) && linesElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var line in linesElement.EnumerateArray())
+            {
+                AddLine(content, line.GetString() ?? string.Empty);
+            }
+        }
+        else if (root.TryGetProperty("html", out var htmlElement))
+        {
+            var html = htmlElement.GetString() ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(html))
+            {
+                content.Html = html;
+            }
+            foreach (var line in ExtractTextLines(html))
+            {
+                AddLine(content, line);
+            }
+        }
+        else if (root.TryGetProperty("url", out var urlElement))
+        {
+            var url = urlElement.GetString();
+            if (!string.IsNullOrWhiteSpace(url))
+            {
+                try
+                {
+                    var html = _httpClient.GetStringAsync(url).GetAwaiter().GetResult();
+                    if (!string.IsNullOrWhiteSpace(html))
+                    {
+                        content.Html = html;
+                    }
+                    foreach (var line in ExtractTextLines(html))
+                    {
+                        AddLine(content, line);
+                    }
+                }
+                catch
+                {
+                    AddLine(content, "Yazdırma içeriği alınamadı.", PrintLineStyle.Bold);
+                }
+            }
+        }
+
+        TryLoadQrImage(content, root);
+
+        return content;
+    }
+
+    private void ApplyPaperSize(PrintDocument document)
+    {
+        try
+        {
+            var targetWidth = _printerWidth.StartsWith("80", StringComparison.OrdinalIgnoreCase) ? 315 : 230; // hundredths of an inch
+            
+            if (document.PrinterSettings?.PaperSizes is { Count: > 0 })
+            {
+                var match = document.PrinterSettings.PaperSizes
+                    .Cast<PaperSize>()
+                    .FirstOrDefault(ps => Math.Abs(ps.Width - targetWidth) <= 5);
+                if (match != null)
+                {
+                    document.DefaultPageSettings.PaperSize = match;
+                    return;
+                }
+            }
+            
+            // Don't set custom paper size, use printer default
+        }
+        catch
+        {
+            // fallback to printer defaults
+        }
+    }
+
+    private bool TryBuildStructuredReceipt(JsonDocument payloadDoc, out PrintContent content)
+    {
+        var root = payloadDoc.RootElement;
+        if (!root.TryGetProperty("order", out var orderElement) || orderElement.ValueKind != JsonValueKind.Object)
+        {
+            content = default!;
+            return false;
+        }
+
+        content = new PrintContent();
+
+        if (orderElement.TryGetProperty("printer_width", out var widthElement) && widthElement.ValueKind == JsonValueKind.String)
+        {
+            PrinterWidth = widthElement.GetString() ?? PrinterWidth;
+        }
+
+        content.PrinterWidth = PrinterWidth;
+
+        TryLoadQrImage(content, orderElement);
+
+        var header = GetFirstNonEmpty(orderElement, "title", "header", "receipt_title") ?? "Sipariş";
+        AddCenteredText(content, header, PrintLineStyle.Bold, spacingAfter: 4f);
+
+        var businessName = GetFirstNonEmpty(root, "business_name", "business") ??
+                           GetFirstNonEmpty(orderElement, "business_name", "business");
+        if (!string.IsNullOrWhiteSpace(businessName))
+        {
+            AddCenteredText(content, businessName, PrintLineStyle.Bold, spacingAfter: 6f);
+        }
+
+        var createdRaw = GetFirstNonEmpty(orderElement, "created_at", "date", "ordered_at", "createdAt");
+        var createdText = FormatDateTimeText(createdRaw);
+        var adisyon = GetFirstNonEmpty(orderElement, "ticket_number", "adisyon_no", "order_number", "display_id", "code", "id");
+        var tableLabel = GetFirstNonEmpty(orderElement, "table", "table_name", "table_label", "area");
+        var platform = GetFirstNonEmpty(orderElement, "platform", "source", "channel", "origin");
+        var branch = GetFirstNonEmpty(orderElement, "business_branch", "store_name");
+        var orderType = NormalizeOrderType(GetFirstNonEmpty(orderElement, "order_type", "type"));
+
+        var firstRowLeft = createdText;
+        var firstRowRight = !string.IsNullOrWhiteSpace(adisyon) ? $"Adisyon No: {adisyon}" : string.Empty;
+        if (!string.IsNullOrWhiteSpace(firstRowLeft) || !string.IsNullOrWhiteSpace(firstRowRight))
+        {
+            AddColumns(content, new[]
+            {
+                new PrintColumn
+                {
+                    Text = firstRowLeft ?? string.Empty,
+                    Style = PrintLineStyle.Small,
+                    Alignment = PrintLineAlignment.Left,
+                    WidthFraction = 0.55f
+                },
+                new PrintColumn
+                {
+                    Text = firstRowRight,
+                    Style = PrintLineStyle.Small,
+                    Alignment = PrintLineAlignment.Right,
+                    WidthFraction = 0.45f
+                }
+            }, spacingAfter: 2f);
+        }
+
+        var rightSecond = !string.IsNullOrWhiteSpace(tableLabel)
+            ? tableLabel
+            : !string.IsNullOrWhiteSpace(branch) ? branch : "-";
+        AddColumns(content, new[]
+        {
+            new PrintColumn
+            {
+                Text = "Adisyon",
+                Style = PrintLineStyle.Small,
+                Alignment = PrintLineAlignment.Left,
+                WidthFraction = 0.35f
+            },
+            new PrintColumn
+            {
+                Text = rightSecond,
+                Style = PrintLineStyle.Small,
+                Alignment = PrintLineAlignment.Right,
+                WidthFraction = 0.65f
+            }
+        }, spacingAfter: 2f);
+
+        AddSeparator(content, thickness: 4f);
+
+        AddColumns(content, new[]
+        {
+            new PrintColumn { Text = "Adet", Style = PrintLineStyle.Bold, Alignment = PrintLineAlignment.Left, WidthFraction = 0.18f },
+            new PrintColumn { Text = "Ürün Adı", Style = PrintLineStyle.Bold, Alignment = PrintLineAlignment.Left, WidthFraction = 0.57f },
+            new PrintColumn { Text = "Fiyat", Style = PrintLineStyle.Bold, Alignment = PrintLineAlignment.Right, WidthFraction = 0.25f }
+        }, spacingAfter: 4f);
+
+        if (orderElement.TryGetProperty("items", out var itemsElement) && itemsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in itemsElement.EnumerateArray())
+            {
+                var quantityText = GetQuantityText(item);
+                var name = GetFirstNonEmpty(item, "name", "product_name", "title") ?? "Ürün";
+                var totalText = GetMoneyText(item, "total", "total_price", "subtotal", "price");
+
+                AddColumns(content, new[]
+                {
+                    new PrintColumn { Text = quantityText, Style = PrintLineStyle.Bold, Alignment = PrintLineAlignment.Left, WidthFraction = 0.18f },
+                    new PrintColumn { Text = name, Style = PrintLineStyle.Bold, Alignment = PrintLineAlignment.Left, WidthFraction = 0.57f },
+                    new PrintColumn { Text = totalText, Style = PrintLineStyle.Bold, Alignment = PrintLineAlignment.Right, WidthFraction = 0.25f }
+                });
+
+                if (item.TryGetProperty("options", out var optionsElement))
+                {
+                    foreach (var optionText in FlattenOptions(optionsElement))
+                    {
+                        AddIndentedText(content, optionText);
+                    }
+                }
+
+                var note = GetFirstNonEmpty(item, "note", "notes", "comment");
+                if (!string.IsNullOrWhiteSpace(note))
+                {
+                    AddIndentedText(content, "Not: " + note.Trim());
+                }
+
+                AddSpacer(content, 2f);
+            }
+        }
+
+        AddSeparator(content);
+
+        var totals = ExtractTotals(orderElement);
+        if (totals.Count > 0)
+        {
+            for (var i = 0; i < totals.Count; i++)
+            {
+                var total = totals[i];
+                var isGrandTotal = i == totals.Count - 1 || total.Emphasize;
+                AddColumns(content, new[]
+                {
+                    new PrintColumn { Text = total.Label, Style = isGrandTotal ? PrintLineStyle.Bold : PrintLineStyle.Normal, Alignment = PrintLineAlignment.Left, WidthFraction = 0.6f },
+                    new PrintColumn { Text = FormatMoney(total.Amount), Style = isGrandTotal ? PrintLineStyle.Bold : PrintLineStyle.Normal, Alignment = PrintLineAlignment.Right, WidthFraction = 0.4f }
+                });
+            }
+
+            AddSeparator(content);
+        }
+
+        var orderId = GetFirstNonEmpty(orderElement, "display_id", "order_number", "ticket_number", "id", "code");
+        if (!string.IsNullOrWhiteSpace(orderId))
+        {
+            AddKeyValue(content, "Sipariş No", orderId);
+        }
+        if (!string.IsNullOrWhiteSpace(platform))
+        {
+            AddKeyValue(content, "Platform", platform);
+        }
+        if (!string.IsNullOrWhiteSpace(orderType))
+        {
+            AddKeyValue(content, "Sipariş Tipi", orderType);
+        }
+
+        var customerElement = orderElement.TryGetProperty("customer", out var cust) && cust.ValueKind == JsonValueKind.Object ? cust : default;
+        var customerName = !customerElement.Equals(default) ? GetFirstNonEmpty(customerElement, "name", "full_name") : GetFirstNonEmpty(orderElement, "customer_name");
+        var customerPhone = !customerElement.Equals(default) ? GetFirstNonEmpty(customerElement, "phone", "gsm") : GetFirstNonEmpty(orderElement, "customer_phone", "phone");
+        var customerAddress = !customerElement.Equals(default) ? GetFirstNonEmpty(customerElement, "address", "full_address") : GetFirstNonEmpty(orderElement, "customer_address", "address");
+        var addressNote = !customerElement.Equals(default) ? GetFirstNonEmpty(customerElement, "address_note", "directions") : GetFirstNonEmpty(orderElement, "delivery_note", "address_note");
+
+        if (!string.IsNullOrWhiteSpace(customerName) || !string.IsNullOrWhiteSpace(customerPhone) || !string.IsNullOrWhiteSpace(customerAddress))
+        {
+            AddSeparator(content, thickness: 5f);
+            AddCenteredText(content, "Müşteri Bilgileri", PrintLineStyle.Bold, spacingAfter: 4f);
+            if (!string.IsNullOrWhiteSpace(customerName))
+            {
+                AddKeyValue(content, "Adı", customerName);
+            }
+            if (!string.IsNullOrWhiteSpace(customerPhone))
+            {
+                AddKeyValue(content, "Telefon", customerPhone);
+            }
+            if (!string.IsNullOrWhiteSpace(customerAddress))
+            {
+                AddKeyValue(content, "Adres", customerAddress);
+            }
+            if (!string.IsNullOrWhiteSpace(addressNote))
+            {
+                AddKeyValue(content, "Adres Notu", addressNote);
+            }
+        }
+
+        var payment = GetFirstNonEmpty(orderElement, "payment_method", "payment", "payment_type");
+        if (!string.IsNullOrWhiteSpace(payment))
+        {
+            AddKeyValue(content, "Ödeme", payment);
+        }
+
+        var orderNote = GetFirstNonEmpty(orderElement, "order_note", "customer_note", "note");
+        if (!string.IsNullOrWhiteSpace(orderNote))
+        {
+            AddSeparator(content, thickness: 5f);
+            AddKeyValue(content, "Sipariş Notu", orderNote);
+        }
+
+        if (orderElement.TryGetProperty("notes", out var notesElement) && notesElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var note in notesElement.EnumerateArray())
+            {
+                var noteText = note.ValueKind switch
+                {
+                    JsonValueKind.String => note.GetString(),
+                    JsonValueKind.Object => GetFirstNonEmpty(note, "text", "value"),
+                    _ => null
+                };
+                if (!string.IsNullOrWhiteSpace(noteText))
+                {
+                    AddKeyValue(content, "Not", noteText.Trim());
+                }
+            }
+        }
+
+        var footer = GetFirstNonEmpty(orderElement, "footer", "footer_text") ??
+                     GetFirstNonEmpty(root, "footer", "footer_text");
+        if (!string.IsNullOrWhiteSpace(footer))
+        {
+            AddSeparator(content, thickness: 5f);
+            AddCenteredText(content, footer.Trim(), PrintLineStyle.Normal);
+        }
+        else
+        {
+            AddSeparator(content, thickness: 5f);
+            AddCenteredText(content, "Afiyet Olsun.", PrintLineStyle.Bold);
+        }
+
+        TryLoadQrImage(content, root);
+
+        if (content.Lines.Count == 0)
+        {
+            content = default!;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static IEnumerable<string> ExtractTextLines(string html)
+    {
+        var withoutScripts = Regex.Replace(html, "<(script|style)[^>]*?>.*?</\\1>", string.Empty,
+            RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        var breakTags = Regex.Replace(withoutScripts, "<(br|p|div|tr|li)[^>]*>", "\n",
+            RegexOptions.IgnoreCase);
+        var text = Regex.Replace(breakTags, "<.*?>", " ", RegexOptions.Singleline);
+        foreach (var line in text.Split('\n'))
+        {
+            var trimmed = System.Net.WebUtility.HtmlDecode(line.Trim());
+            if (!string.IsNullOrEmpty(trimmed))
+            {
+                yield return trimmed;
+            }
+        }
+    }
+
+    private static void AddLine(PrintContent content, string raw, PrintLineStyle? forcedStyle = null)
+    {
+        if (raw == null)
+        {
+            return;
+        }
+
+        var trimmedEnd = raw.TrimEnd();
+        if (string.IsNullOrWhiteSpace(trimmedEnd))
+        {
+            AddSpacer(content, 4f);
+            return;
+        }
+
+        if (IsSeparator(trimmedEnd))
+        {
+            AddSeparator(content);
+            return;
+        }
+
+        var trimmed = trimmedEnd.Trim();
+        if (TryParseKeyValueLine(trimmed, out var key, out var value))
+        {
+            AddColumns(content, new[]
+            {
+                new PrintColumn
+                {
+                    Text = key,
+                    Style = PrintLineStyle.Bold,
+                    Alignment = PrintLineAlignment.Left,
+                    WidthFraction = 0.45f
+                },
+                new PrintColumn
+                {
+                    Text = value,
+                    Style = PrintLineStyle.Normal,
+                    Alignment = PrintLineAlignment.Right,
+                    WidthFraction = 0.55f
+                }
+            });
+            return;
+        }
+
+        var isIndented = raw.StartsWith("   ", StringComparison.Ordinal);
+        var normalized = trimmed;
+
+        if (isIndented)
+        {
+            if (normalized.StartsWith("+") || normalized.StartsWith("-") || normalized.StartsWith("•"))
+            {
+                normalized = "- " + normalized.TrimStart('+', '-', '•', ' ');
+            }
+            else if (normalized.StartsWith("Not", StringComparison.OrdinalIgnoreCase))
+            {
+                normalized = normalized;
+            }
+        }
+
+        var style = forcedStyle ?? DetermineStyle(normalized, isIndented);
+        var alignment = DetermineAlignment(normalized, isIndented);
+
+        content.Lines.Add(new PrintLine
+        {
+            Kind = PrintLineKind.Text,
+            Text = normalized,
+            Style = style,
+            Alignment = alignment
+        });
+    }
+
+    private static PrintLineStyle DetermineStyle(string text, bool isIndented)
+    {
+        if (isIndented)
+        {
+            return PrintLineStyle.Small;
+        }
+
+        if (text.StartsWith("SIPAR", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("TOPLAM", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("Musteri", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("Tel", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("Adres", StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith("Masa", StringComparison.OrdinalIgnoreCase))
+        {
+            return PrintLineStyle.Bold;
+        }
+
+        if (text.Contains(" x ") || text.Contains(" • "))
+        {
+            return PrintLineStyle.Bold;
+        }
+
+        return PrintLineStyle.Normal;
+    }
+
+    private static PrintLineAlignment DetermineAlignment(string text, bool isIndented)
+    {
+        var trimmed = text.Trim();
+        if (trimmed.Length == 0)
+        {
+            return PrintLineAlignment.Left;
+        }
+
+        if (IsSeparator(trimmed))
+        {
+            return PrintLineAlignment.Left;
+        }
+
+        if (!isIndented &&
+            trimmed.Length <= 22 &&
+            trimmed == trimmed.ToUpper(TrCulture) &&
+            trimmed.Any(char.IsLetter) &&
+            !trimmed.Contains(':'))
+        {
+            return PrintLineAlignment.Center;
+        }
+
+        return PrintLineAlignment.Left;
+    }
+
+    private static bool IsSeparator(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var trimmed = text.Trim();
+        if (trimmed.Length < 3)
+        {
+            return false;
+        }
+
+        return trimmed.All(ch => ch is '=' or '-' or '_' or '—');
+    }
+
+    private static bool TryParseKeyValueLine(string text, out string key, out string value)
+    {
+        key = string.Empty;
+        value = string.Empty;
+
+        var index = text.IndexOf(':');
+        if (index <= 0 || index >= text.Length - 1)
+        {
+            return false;
+        }
+
+        key = text[..index].Trim();
+        value = text[(index + 1)..].Trim();
+
+        if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static void AddSpacer(PrintContent content, float? amount = null)
+    {
+        content.Lines.Add(new PrintLine
+        {
+            Kind = PrintLineKind.Spacer,
+            CustomSpacing = amount ?? 4f
+        });
+    }
+
+    private static void AddSeparator(PrintContent content, float thickness = 4f)
+    {
+        content.Lines.Add(new PrintLine
+        {
+            Kind = PrintLineKind.Separator,
+            CustomSpacing = thickness
+        });
+    }
+
+    private static void AddCenteredText(PrintContent content, string? text, PrintLineStyle style, float? spacingAfter = null)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        content.Lines.Add(new PrintLine
+        {
+            Kind = PrintLineKind.Text,
+            Text = text.Trim(),
+            Style = style,
+            Alignment = PrintLineAlignment.Center,
+            CustomSpacing = spacingAfter
+        });
+    }
+
+    private static void AddColumns(PrintContent content, IEnumerable<PrintColumn> columns, float? spacingAfter = null)
+    {
+        var list = columns?.Where(c => c != null).ToList();
+        if (list is not { Count: > 0 })
+        {
+            return;
+        }
+
+        content.Lines.Add(new PrintLine
+        {
+            Kind = PrintLineKind.Columns,
+            Columns = list,
+            CustomSpacing = spacingAfter
+        });
+    }
+
+    private static void AddIndentedText(PrintContent content, string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        content.Lines.Add(new PrintLine
+        {
+            Kind = PrintLineKind.Text,
+            Text = "- " + text.Trim(),
+            Style = PrintLineStyle.Small,
+            Alignment = PrintLineAlignment.Left
+        });
+    }
+
+    private static void AddKeyValue(PrintContent content, string label, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        AddColumns(content, new[]
+        {
+            new PrintColumn
+            {
+                Text = label,
+                Style = PrintLineStyle.Bold,
+                Alignment = PrintLineAlignment.Left,
+                WidthFraction = 0.32f
+            },
+            new PrintColumn
+            {
+                Text = value.Trim(),
+                Style = PrintLineStyle.Normal,
+                Alignment = PrintLineAlignment.Left,
+                WidthFraction = 0.68f
+            }
+        });
+    }
+
+    private static string? GetFirstNonEmpty(JsonElement element, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            if (!element.TryGetProperty(name, out var property))
+            {
+                continue;
+            }
+
+            switch (property.ValueKind)
+            {
+                case JsonValueKind.String:
+                    var value = property.GetString();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        return value.Trim();
+                    }
+                    break;
+                case JsonValueKind.Number:
+                    return property.GetDouble().ToString(TrCulture);
+                case JsonValueKind.True:
+                case JsonValueKind.False:
+                    return property.GetBoolean() ? "Evet" : "Hayır";
+            }
+        }
+
+        return null;
+    }
+
+    private static string FormatDateTimeText(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return string.Empty;
+        }
+
+        if (DateTime.TryParse(raw, TrCulture, DateTimeStyles.AssumeLocal, out var dt))
+        {
+            return dt.ToString("dd.MM.yyyy HH:mm", TrCulture);
+        }
+
+        if (long.TryParse(raw, out var timestamp))
+        {
+            try
+            {
+                var date = DateTimeOffset.FromUnixTimeSeconds(timestamp).LocalDateTime;
+                return date.ToString("dd.MM.yyyy HH:mm", TrCulture);
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        return raw.Trim();
+    }
+
+    private static string? NormalizeOrderType(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return null;
+        }
+
+        var value = raw.Trim().ToLowerInvariant();
+        return value switch
+        {
+            "delivery" or "adrese teslim" => "Adrese Teslim",
+            "pickup" or "gelal" or "gel-al" or "takeaway" => "Gel-Al",
+            "selfservice" or "self_service" or "self servis" => "Self Servis",
+            _ => char.ToUpper(raw[0], TrCulture) + raw[1..]
+        };
+    }
+
+    private static string GetQuantityText(JsonElement item)
+    {
+        if (item.TryGetProperty("quantity", out var qtyElement))
+        {
+            if (qtyElement.ValueKind == JsonValueKind.Number)
+            {
+                var qty = qtyElement.GetDecimal();
+                return qty % 1 == 0 ? ((int)qty).ToString(TrCulture) : qty.ToString("0.##", TrCulture);
+            }
+
+            if (qtyElement.ValueKind == JsonValueKind.String)
+            {
+                var text = qtyElement.GetString();
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    return text.Trim();
+                }
+            }
+        }
+
+        return "1";
+    }
+
+    private static string GetMoneyText(JsonElement element, params string[] propertyNames)
+    {
+        foreach (var propertyName in propertyNames)
+        {
+            if (!element.TryGetProperty(propertyName, out var property))
+            {
+                continue;
+            }
+
+            decimal amount;
+            if (property.ValueKind == JsonValueKind.Number)
+            {
+                amount = property.GetDecimal();
+                return FormatMoney(amount);
+            }
+
+            if (property.ValueKind == JsonValueKind.String &&
+                decimal.TryParse(property.GetString(), NumberStyles.Any, TrCulture, out amount))
+            {
+                return FormatMoney(amount);
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static bool TryGetDecimal(JsonElement element, string propertyName, out decimal value)
+    {
+        value = 0m;
+        if (!element.TryGetProperty(propertyName, out var property))
+        {
+            return false;
+        }
+
+        switch (property.ValueKind)
+        {
+            case JsonValueKind.Number:
+                value = property.GetDecimal();
+                return true;
+            case JsonValueKind.String:
+                var text = property.GetString();
+                if (!string.IsNullOrWhiteSpace(text) && decimal.TryParse(text, NumberStyles.Any, TrCulture, out var parsed))
+                {
+                    value = parsed;
+                    return true;
+                }
+                break;
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<string> FlattenOptions(JsonElement optionsElement)
+    {
+        if (optionsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var option in optionsElement.EnumerateArray())
+            {
+                switch (option.ValueKind)
+                {
+                    case JsonValueKind.String:
+                        var value = option.GetString();
+                        if (!string.IsNullOrWhiteSpace(value))
+                        {
+                            yield return value.Trim();
+                        }
+                        break;
+                    case JsonValueKind.Object:
+                        var group = GetFirstNonEmpty(option, "group", "group_name", "title");
+                        var name = GetFirstNonEmpty(option, "option", "name", "value");
+                        if (string.IsNullOrWhiteSpace(group) && string.IsNullOrWhiteSpace(name))
+                        {
+                            continue;
+                        }
+
+                        var text = string.IsNullOrWhiteSpace(group)
+                            ? (name ?? string.Empty)
+                            : $"{group}: {name}";
+
+                        if (TryGetDecimal(option, "price", out var optionPrice) && optionPrice != 0)
+                        {
+                            var sign = optionPrice > 0 ? "+" : "-";
+                            text = $"{text} ({sign}{FormatMoney(Math.Abs(optionPrice))})";
+                        }
+
+                        yield return text.Trim(':', ' ');
+                        break;
+                }
+            }
+        }
+    }
+
+    private static List<ReceiptTotal> ExtractTotals(JsonElement orderElement)
+    {
+        var totals = new List<ReceiptTotal>();
+        if (orderElement.TryGetProperty("totals", out var totalsElement) && totalsElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var totalElement in totalsElement.EnumerateArray())
+            {
+                var label = GetFirstNonEmpty(totalElement, "label", "title");
+                if (string.IsNullOrWhiteSpace(label))
+                {
+                    continue;
+                }
+
+                if (!TryGetDecimal(totalElement, "amount", out var amount) &&
+                    !TryGetDecimal(totalElement, "value", out amount) &&
+                    !TryGetDecimal(totalElement, "total", out amount))
+                {
+                    var textValue = GetFirstNonEmpty(totalElement, "amount_text", "value_text");
+                    if (string.IsNullOrWhiteSpace(textValue) || !decimal.TryParse(textValue, NumberStyles.Any, TrCulture, out amount))
+                    {
+                        continue;
+                    }
+                }
+
+                var emphasize = totalElement.TryGetProperty("emphasize", out var emphasizeElement) && emphasizeElement.ValueKind == JsonValueKind.True;
+                totals.Add(new ReceiptTotal(label, amount, emphasize));
+            }
+        }
+        else
+        {
+            void AddIfExists(string label, string property, bool emphasize = false)
+            {
+                if (TryGetDecimal(orderElement, property, out var amount))
+                {
+                    totals.Add(new ReceiptTotal(label, amount, emphasize));
+                }
+            }
+
+            AddIfExists("Ara Toplam", "subtotal");
+            AddIfExists("İndirim", "discount");
+            AddIfExists("Servis Ücreti", "service_fee");
+            AddIfExists("Gönderim Ücreti", "delivery_fee");
+            AddIfExists("Toplam", "total", emphasize: true);
+            AddIfExists("Ödenecek", "grand_total", emphasize: true);
+        }
+
+        if (totals.Count > 1)
+        {
+            // Ensure last row emphasized
+            var last = totals[^1];
+            totals[^1] = new ReceiptTotal(last.Label, last.Amount, true);
+        }
+
+        return totals;
+    }
+
+    private static string FormatMoney(decimal amount)
+    {
+        return amount.ToString("N2", TrCulture) + " ₺";
+    }
+
+    private void TryLoadQrImage(PrintContent content, JsonElement element)
+    {
+        if (content.QrImage != null)
+        {
+            return;
+        }
+
+        if (TryExtractQrUrl(element, out var url))
+        {
+            AssignQrImage(content, url);
+        }
+    }
+
+    private static bool TryExtractQrUrl(JsonElement element, out string url)
+    {
+        var propertyNames = new[] { "qr_image", "qr_url", "qrcode", "qrCode", "qr" };
+        foreach (var propertyName in propertyNames)
+        {
+            if (element.TryGetProperty(propertyName, out var property) && property.ValueKind == JsonValueKind.String)
+            {
+                var value = property.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    url = value;
+        return true;
+    }
+
+    private string NormalizePrinterWidth(string? requested)
+    {
+        if (string.IsNullOrWhiteSpace(requested))
+        {
+            return PrinterWidth;
+        }
+
+        var normalized = requested.Trim().ToLowerInvariant();
+        if (normalized.Contains("80") || normalized.Contains("72") || normalized.Contains("3"))
+        {
+            return "80mm";
+        }
+
+        return "58mm";
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        _htmlPrinter.Dispose();
+    }
+}
+        }
+
+        url = string.Empty;
+        return false;
+    }
+
+    private void AssignQrImage(PrintContent content, string? url)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return;
+        }
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Add("User-Agent", "MenuBu-Printer-Agent/2.0");
+                using var response = _httpClient.SendAsync(request).GetAwaiter().GetResult();
+                response.EnsureSuccessStatusCode();
+                var bytes = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                if (bytes.Length > 0)
+                {
+                    using var ms = new MemoryStream(bytes);
+                    content.QrImage = new Bitmap(ms);
+                    return;
+                }
+            }
+            catch
+            {
+                if (attempt == 2)
+                {
+                    // Son deneme başarısız, QR kod olmadan devam et
+                    return;
+                }
+                System.Threading.Thread.Sleep(500);
+            }
+        }
+    }
+
+    private readonly struct ReceiptTotal
+    {
+        public ReceiptTotal(string label, decimal amount, bool emphasize)
+        {
+            Label = label;
+            Amount = amount;
+            Emphasize = emphasize;
+        }
+
+        public string Label { get; }
+        public decimal Amount { get; }
+        public bool Emphasize { get; }
+    }
+}
