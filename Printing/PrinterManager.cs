@@ -589,62 +589,19 @@ internal sealed class PrinterManager : IDisposable
             PrinterWidth = widthElement.GetString() ?? PrinterWidth;
         }
 
+        var htmlContent = TryBuildHtmlContent(root, out var attemptedHtmlDownload);
+        if (htmlContent != null)
+        {
+            return htmlContent;
+        }
+
         if (TryBuildStructuredReceipt(payloadDoc, out var structuredContent) && structuredContent.Lines.Count > 0)
         {
             structuredContent.PrinterWidth = PrinterWidth;
             return structuredContent;
         }
 
-        var content = new PrintContent
-        {
-            PrinterWidth = PrinterWidth
-        };
-        if (root.TryGetProperty("lines", out var linesElement) && linesElement.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var line in linesElement.EnumerateArray())
-            {
-                AddLine(content, line.GetString() ?? string.Empty);
-            }
-        }
-        else if (root.TryGetProperty("html", out var htmlElement))
-        {
-            var html = htmlElement.GetString() ?? string.Empty;
-            if (!string.IsNullOrWhiteSpace(html))
-            {
-                content.Html = html;
-            }
-            foreach (var line in ExtractTextLines(html))
-            {
-                AddLine(content, line);
-            }
-        }
-        else if (root.TryGetProperty("url", out var urlElement))
-        {
-            var url = urlElement.GetString();
-            if (!string.IsNullOrWhiteSpace(url))
-            {
-                try
-                {
-                    var html = _httpClient.GetStringAsync(url).GetAwaiter().GetResult();
-                    if (!string.IsNullOrWhiteSpace(html))
-                    {
-                        content.Html = html;
-                    }
-                    foreach (var line in ExtractTextLines(html))
-                    {
-                        AddLine(content, line);
-                    }
-                }
-                catch
-                {
-                    AddLine(content, "Yazdırma içeriği alınamadı.", PrintLineStyle.Bold);
-                }
-            }
-        }
-
-        TryLoadQrImage(content, root);
-
-        return content;
+        return BuildFallbackLinesContent(root, attemptedHtmlDownload);
     }
 
     private void ApplyPaperSize(PrintDocument document)
@@ -912,6 +869,107 @@ internal sealed class PrinterManager : IDisposable
         }
 
         return true;
+    }
+
+    private PrintContent? TryBuildHtmlContent(JsonElement root, out bool attemptedRemoteHtml)
+    {
+        var html = ResolveHtmlContent(root, out attemptedRemoteHtml);
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return null;
+        }
+
+        var content = new PrintContent
+        {
+            PrinterWidth = PrinterWidth,
+            Html = html
+        };
+
+        var appendedExplicitLines = false;
+        if (root.TryGetProperty("lines", out var linesElement) && linesElement.ValueKind == JsonValueKind.Array && linesElement.GetArrayLength() > 0)
+        {
+            appendedExplicitLines = true;
+            foreach (var line in linesElement.EnumerateArray())
+            {
+                AddLine(content, line.GetString() ?? string.Empty);
+            }
+        }
+
+        if (!appendedExplicitLines)
+        {
+            foreach (var line in ExtractTextLines(html))
+            {
+                AddLine(content, line);
+            }
+        }
+
+        TryLoadQrImage(content, root);
+        return content;
+    }
+
+    private PrintContent BuildFallbackLinesContent(JsonElement root, bool attemptedRemoteHtml)
+    {
+        var content = new PrintContent
+        {
+            PrinterWidth = PrinterWidth
+        };
+
+        if (root.TryGetProperty("lines", out var linesElement) && linesElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var line in linesElement.EnumerateArray())
+            {
+                AddLine(content, line.GetString() ?? string.Empty);
+            }
+        }
+        else
+        {
+            var fallbackMessage = attemptedRemoteHtml
+                ? "HTML içeriği alınamadı."
+                : "Yazdırma içeriği bulunamadı.";
+            AddLine(content, fallbackMessage, PrintLineStyle.Bold);
+        }
+
+        TryLoadQrImage(content, root);
+        return content;
+    }
+
+    private string? ResolveHtmlContent(JsonElement root, out bool attemptedRemoteHtml)
+    {
+        attemptedRemoteHtml = false;
+        if (root.TryGetProperty("html", out var htmlElement) && htmlElement.ValueKind == JsonValueKind.String)
+        {
+            var html = htmlElement.GetString();
+            if (!string.IsNullOrWhiteSpace(html))
+            {
+                return html;
+            }
+        }
+
+        string? url = null;
+        if (root.TryGetProperty("print_url", out var printUrlElement) && printUrlElement.ValueKind == JsonValueKind.String)
+        {
+            url = printUrlElement.GetString();
+        }
+        else if (root.TryGetProperty("url", out var urlElement) && urlElement.ValueKind == JsonValueKind.String)
+        {
+            url = urlElement.GetString();
+        }
+
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        attemptedRemoteHtml = true;
+        try
+        {
+            var html = _httpClient.GetStringAsync(url).GetAwaiter().GetResult();
+            return string.IsNullOrWhiteSpace(html) ? null : html;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static IEnumerable<string> ExtractTextLines(string html)
